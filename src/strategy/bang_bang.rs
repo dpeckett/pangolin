@@ -17,6 +17,7 @@
 use crate::resource::AutoScalerBangBangStrategyConfiguration;
 use crate::strategy::AutoScalerStrategyTrait;
 
+/// Implementation of a bang-bang controller.
 #[derive(Clone, Debug)]
 pub struct BangBangAutoScalerStrategy {
     configuration: AutoScalerBangBangStrategyConfiguration,
@@ -31,8 +32,10 @@ impl BangBangAutoScalerStrategy {
 impl AutoScalerStrategyTrait for BangBangAutoScalerStrategy {
     fn evaluate(&self, _replicas: u32, value: f64) -> Option<i32> {
         if value <= self.configuration.lower {
+            // Below the configured lower threshold, scale down one replica.
             Some(-1)
         } else if value >= self.configuration.upper {
+            // Above the configured upper threshold, scale up one replica.
             Some(1)
         } else {
             None

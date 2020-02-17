@@ -21,48 +21,106 @@ use crate::kubernetes::statefulset::KubernetesStatefulSetResource;
 use crate::kubernetes::KubernetesResource;
 use crate::kubernetes::KubernetesResourceTrait;
 use crate::kubernetes::{KubernetesObject, KubernetesObjectTrait};
-use crate::metrics::MetricsRetriever;
+use crate::metrics::retrieve_aggregate_metric;
 use crate::resource::{AutoScaler, AutoScalerKubernetesResourceKind, AutoScalerStrategyKind};
 use crate::strategy::bang_bang::BangBangAutoScalerStrategy;
 use crate::strategy::AutoScalerStrategy;
 use crate::strategy::AutoScalerStrategyTrait;
 use crate::timer::CancellableInterval;
 use chrono::{DateTime, Utc};
-use clap::{crate_authors, crate_description, crate_name, crate_version, App};
+use clap::{
+    arg_enum, crate_authors, crate_description, crate_name, crate_version, value_t, App, Arg,
+};
 use futures::channel::mpsc::unbounded;
 use futures::channel::mpsc::UnboundedSender;
 use futures::{SinkExt, StreamExt};
 use kube::api::{Api, Informer, ListParams, WatchEvent};
 use kube::client::APIClient;
 use kube::config;
-use slog::{error, info, o, warn, Drain, Logger};
-use snafu::OptionExt;
+use slog::{debug, error, info, o, warn, Drain, Level, LevelFilter, Logger};
 use snafu::ResultExt;
-use std::collections::{BTreeMap, HashMap};
-use std::sync::{Arc, Mutex};
+use std::collections::HashMap;
+use std::panic;
+use std::process::exit;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
+use tokio::sync::Mutex;
 use tokio::sync::RwLock;
 
+/// Pangolin error types.
 mod error;
+/// Kubernetes api abstraction.
 #[allow(clippy::type_complexity)]
 mod kubernetes;
+/// Prometheus metrics related functions.
 mod metrics;
+/// AutoScaler specification types.
 mod resource;
+/// AutoScaler control strategies.
 mod strategy;
+/// Interval time sources.
 mod timer;
+
+arg_enum! {
+    /// Log level command line argument.
+    #[derive(PartialEq, Debug)]
+    pub enum LogLevelArgument {
+        Critical,
+        Error,
+        Warning,
+        Info,
+        Debug,
+        Trace,
+    }
+}
+
+impl From<LogLevelArgument> for Level {
+    fn from(level_arg: LogLevelArgument) -> Level {
+        match level_arg {
+            LogLevelArgument::Critical => Level::Critical,
+            LogLevelArgument::Error => Level::Error,
+            LogLevelArgument::Warning => Level::Warning,
+            LogLevelArgument::Info => Level::Info,
+            LogLevelArgument::Debug => Level::Debug,
+            LogLevelArgument::Trace => Level::Trace,
+        }
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
-    let logger = slog::Logger::root(
-        Mutex::new(slog_json::Json::default(std::io::stdout())).map(slog::Fuse),
-        o!("application" => crate_name!(), "version" => crate_version!()),
-    );
+    // Replace the panic handler with one that will exit the process on panics (in any thread).
+    // This makes it easy for Kubernetes to restart the process if we hit anything really weird.
+    let default_hook = panic::take_hook();
+    panic::set_hook(Box::new(move |info| {
+        default_hook(info);
+        exit(1);
+    }));
 
-    let _matches = App::new(crate_name!())
+    let matches = App::new(crate_name!())
         .version(crate_version!())
         .about(crate_description!())
         .author(crate_authors!())
+        .arg(
+            Arg::with_name("LOG_LEVEL")
+                .long("log-level")
+                .help("set the application log level")
+                .takes_value(true)
+                .possible_values(&LogLevelArgument::variants())
+                .case_insensitive(true)
+                .default_value("Info"),
+        )
         .get_matches();
+
+    let log_level = value_t!(matches, "LOG_LEVEL", LogLevelArgument).unwrap_or_else(|e| e.exit());
+    let logger = Logger::root(
+        StdMutex::new(LevelFilter::new(
+            slog_json::Json::default(std::io::stdout()),
+            log_level.into(),
+        ))
+        .map(slog::Fuse),
+        o!("application" => crate_name!(), "version" => crate_version!()),
+    );
 
     let kube_config = if let Ok(kube_config) = kube::config::incluster_config() {
         kube_config
@@ -91,7 +149,7 @@ async fn main() -> Result<(), Error> {
         );
         task_handle.insert(
             task_key,
-            spawn_task(
+            autoscaler_loop(
                 logger.new(o!(
                     "autoscaler_namespace" => autoscaler.metadata.namespace.as_ref().unwrap().clone(),
                     "autoscaler_name" => autoscaler.metadata.name.clone())),
@@ -107,8 +165,6 @@ async fn main() -> Result<(), Error> {
         .init()
         .await
         .context(Kube {})?;
-
-    info!(logger, "Watching for AutoScaler events");
 
     // Loop enables us to drop and refresh the kubernetes watcher periodically
     // reduces the reliance on long lived connections and provides us a bit more resiliency.
@@ -127,17 +183,19 @@ async fn main() -> Result<(), Error> {
             }
         };
 
+        // Loop over all AutoScaler object changes.
         while let Some(Ok(event)) = events.next().await {
             match event {
                 WatchEvent::Added(autoscaler) => {
+                    // New AutoScaler has been added. Start a fresh AutoScaler loop.
                     let autoscaler_namespace = autoscaler.metadata.namespace.as_ref().unwrap();
-                    info!(logger, "Added AutoScaler";
+                    info!(logger, "Added autoscaler";
                         "autoscaler_namespace" => autoscaler_namespace,
                         "autoscaler_name" => &autoscaler.metadata.name);
                     let task_key = format!("{}/{}", autoscaler_namespace, autoscaler.metadata.name);
                     task_handle.insert(
                         task_key,
-                        spawn_task(
+                        autoscaler_loop(
                             logger.new(o!(
                                 "autoscaler_namespace" => autoscaler_namespace.clone(),
                                 "autoscaler_name" => autoscaler.metadata.name.clone())),
@@ -147,20 +205,23 @@ async fn main() -> Result<(), Error> {
                     );
                 }
                 WatchEvent::Modified(autoscaler) => {
+                    // AutoScaler object has been modified. Send across the updated object.
                     let autoscaler_namespace = autoscaler.metadata.namespace.as_ref().unwrap();
-                    info!(logger, "Modified AutoScaler";
+                    info!(logger, "Modified autoscaler";
                         "autoscaler_namespace" => autoscaler_namespace,
                         "autoscaler_name" => &autoscaler.metadata.name);
                     let task_key = format!("{}/{}", autoscaler_namespace, autoscaler.metadata.name);
                     if let Some(task_handle) = task_handle.get_mut(&task_key) {
                         task_handle.send(autoscaler.clone()).await.unwrap();
                     } else {
-                        warn!(logger, "Adding Missing AutoScaler";
+                        // Somehow we received an update for an object we haven't already created.
+                        // we must have missed the addition of an AutoScaler somehow. Concerning...
+                        warn!(logger, "Adding missing autoscaler";
                         "autoscaler_namespace" => autoscaler_namespace,
                         "autoscaler_name" => &autoscaler.metadata.name);
                         task_handle.insert(
                             task_key,
-                            spawn_task(
+                            autoscaler_loop(
                                 logger.new(o!(
                                     "autoscaler_namespace" => autoscaler_namespace.clone(),
                                     "autoscaler_name" => autoscaler.metadata.name.clone())),
@@ -171,8 +232,9 @@ async fn main() -> Result<(), Error> {
                     }
                 }
                 WatchEvent::Deleted(autoscaler) => {
+                    // AutoScaler object has been deleted. Shutdown all subtasks.
                     let autoscaler_namespace = autoscaler.metadata.namespace.as_ref().unwrap();
-                    info!(logger, "Deleted AutoScaler";
+                    info!(logger, "Deleted autoscaler";
                         "autoscaler_namespace" => autoscaler_namespace,
                         "autoscaler_name" => &autoscaler.metadata.name);
                     let task_key = format!("{}/{}", autoscaler_namespace, autoscaler.metadata.name);
@@ -180,30 +242,43 @@ async fn main() -> Result<(), Error> {
                     task_handle.remove(&task_key);
                 }
                 WatchEvent::Error(err) => {
-                    error!(logger, "AutoScaler error"; "error" => format!("{}", err))
+                    // AutoScaler object error.
+                    error!(logger, "Autoscaler error"; "error" => format!("{}", err))
                 }
             }
         }
     }
 }
 
-fn spawn_task(
+/// Spawn a set of looping tasks to handle all the subtasks associated with an AutoScaler object.
+fn autoscaler_loop(
     logger: Logger,
     kube_config: kube::config::Configuration,
     autoscaler: AutoScaler,
 ) -> Result<UnboundedSender<AutoScaler>, Error> {
+    // Create a channel for receiving updated AutoScaler specifications.
     let (update_sender, mut update_receiver) = unbounded::<AutoScaler>();
 
+    // Create an interval timer for the reconciliation loop.
     let timer = Arc::new(RwLock::new(CancellableInterval::new(Duration::from_secs(
         autoscaler.spec.interval as u64,
     ))));
-    let spec = Arc::new(RwLock::new(Some(autoscaler)));
+    // Create an interval timer for the metrics retrieval subtask.
+    let metric_timer = Arc::new(RwLock::new(CancellableInterval::new(Duration::from_secs(
+        autoscaler.spec.metric.interval as u64,
+    ))));
+
+    let autoscaler_namespace = String::from(autoscaler.metadata.namespace.as_ref().unwrap());
+    let autoscaler = Arc::new(RwLock::new(Some(autoscaler)));
 
     let timer_handle = timer.clone();
-    let spec_update_handle = spec.clone();
+    let metric_timer_handle = metric_timer.clone();
+    let autoscaler_update_handle = autoscaler.clone();
     let timer_logger = logger.clone();
+
+    // AutoScaler update receiver subtask.
     tokio::spawn(async move {
-        let initial_period = spec_update_handle
+        let initial_period = autoscaler_update_handle
             .read()
             .await
             .as_ref()
@@ -211,94 +286,390 @@ fn spawn_task(
             .spec
             .interval;
 
-        info!(timer_logger, "Starting AutoScaler interval source";
+        debug!(timer_logger, "Starting autoscaler interval source";
             "period" => initial_period);
 
-        while let Some(updated_spec) = update_receiver.next().await {
+        // Process any changes to an AutoScalers timing. And update our shared AutoScaler object.
+        while let Some(updated_autoscaler) = update_receiver.next().await {
             timer_handle
                 .read()
                 .await
-                .set_period(Duration::from_secs(updated_spec.spec.interval as u64));
-            info!(timer_logger, "Updated AutoScaler interval source";
-                "period" => updated_spec.spec.interval);
+                .set_period(Duration::from_secs(updated_autoscaler.spec.interval as u64));
 
-            spec_update_handle.write().await.replace(updated_spec);
-        }
+            debug!(timer_logger, "Updated autoscaler interval source";
+                "period" => updated_autoscaler.spec.interval);
 
-        timer_handle.read().await.cancel();
-        info!(timer_logger, "Stopped AutoScaler interval source");
-    });
-
-    tokio::spawn(async move {
-        let autoscaler_namespace = String::from(
-            spec.read()
-                .await
-                .as_ref()
-                .unwrap()
-                .metadata
-                .namespace
-                .as_ref()
-                .unwrap(),
-        );
-        info!(logger, "Starting AutoScaler task");
-
-        while let Some(_) = timer.write().await.next().await {
-            let resource_kind = spec.read().await.as_ref().unwrap().spec.kind.clone();
-            let match_labels = spec
+            metric_timer_handle
                 .read()
                 .await
-                .as_ref()
-                .unwrap()
-                .spec
-                .selector
-                .match_labels
-                .clone();
+                .set_period(Duration::from_secs(
+                    updated_autoscaler.spec.metric.interval as u64,
+                ));
 
+            debug!(timer_logger, "Updated autoscaler metric interval source";
+                "period" => updated_autoscaler.spec.interval);
+
+            autoscaler_update_handle
+                .write()
+                .await
+                .replace(updated_autoscaler);
+        }
+
+        // Shutdown interval sources, will lead to the completion of subtasks that depend upon them.
+        // Eg. is used to propagate a full shutdown.
+        timer_handle.read().await.cancel();
+        metric_timer_handle.read().await.cancel();
+        debug!(timer_logger, "Stopped autoscaler interval sources");
+    });
+
+    // A repository for storing a window worth of retrieved metrics.
+    // This will leak a small amount of memory when matching objects get deleted.
+    let metric_repository: Arc<Mutex<HashMap<String, Vec<f64>>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+
+    // AutoScaler metrics retrieval subtask.
+    tokio::spawn(metric_retriever_loop(
+        logger.clone(),
+        kube_config.clone(),
+        autoscaler_namespace.clone(),
+        autoscaler.clone(),
+        metric_timer,
+        metric_repository.clone(),
+    ));
+
+    // AutoScaler reconciliation subtask.
+    tokio::spawn(async move {
+        debug!(logger, "Starting autoscaler task");
+
+        while let Some(_) = timer.write().await.next().await {
             // Create the strategy fresh each time, to simplify handling autoscaler spec changes.
-            let strategy = match &spec.read().await.as_ref().unwrap().spec.strategy {
+            let strategy = match &autoscaler.read().await.as_ref().unwrap().spec.strategy {
                 AutoScalerStrategyKind::BangBang => {
-                    AutoScalerStrategy::BangBang(BangBangAutoScalerStrategy::new(
-                        spec.read()
-                            .await
-                            .as_ref()
-                            .unwrap()
-                            .spec
-                            .bang_bang
-                            .as_ref()
-                            .context(KubeSpec {})
-                            .unwrap()
-                            .clone(),
-                    ))
+                    if let Some(bang_bang) =
+                        &autoscaler.read().await.as_ref().unwrap().spec.bang_bang
+                    {
+                        Some(AutoScalerStrategy::BangBang(
+                            BangBangAutoScalerStrategy::new(bang_bang.clone()),
+                        ))
+                    } else {
+                        None
+                    }
                 }
             };
 
-            autoscaler_loop(
-                logger.clone(),
-                kube_config.clone(),
-                spec.clone(),
-                autoscaler_namespace.clone(),
-                resource_kind,
-                match_labels,
-                strategy,
-            )
-            .await;
+            if let Some(strategy) = strategy {
+                // Spawn subtasks to handle reconciliation of each matching object.
+                spawn_reconciliation_tasks(
+                    logger.clone(),
+                    kube_config.clone(),
+                    autoscaler.clone(),
+                    autoscaler_namespace.clone(),
+                    strategy,
+                    metric_repository.clone(),
+                )
+                .await;
+            } else {
+                error!(
+                    logger,
+                    "Autoscaler is missing required autoscaling strategy configuration"
+                );
+            }
         }
 
-        info!(logger, "Stopped AutoScaler task");
+        debug!(logger, "Stopped autoscaler task");
     });
 
     Ok(update_sender)
 }
 
-async fn autoscaler_loop(
+/// Task to pull metrics from all objects associated with an AutoScaler.
+async fn metric_retriever_loop(
+    logger: Logger,
+    kube_config: kube::config::Configuration,
+    autoscaler_namespace: String,
+    autoscaler: Arc<RwLock<Option<AutoScaler>>>,
+    metric_timer: Arc<RwLock<CancellableInterval>>,
+    metric_repository: Arc<Mutex<HashMap<String, Vec<f64>>>>,
+) {
+    debug!(logger, "Starting autoscaler metric task");
+
+    while let Some(_) = metric_timer.write().await.next().await {
+        let metric_name = autoscaler
+            .read()
+            .await
+            .as_ref()
+            .unwrap()
+            .spec
+            .metric
+            .name
+            .clone();
+
+        if let Ok(kubernetes_objects) = matching_objects(
+            logger.clone(),
+            kube_config.clone(),
+            autoscaler_namespace.clone(),
+            autoscaler.clone(),
+        )
+        .await
+        {
+            for kubernetes_object in kubernetes_objects {
+                // Resolve the name and namespace of the object.
+                let (object_namespace, object_name) = kubernetes_object.namespace_and_name();
+                debug!(logger.clone(), "Autoscaler metric task found matching object";
+                    "object_namespace" => &object_namespace,
+                    "object_name" => &object_name);
+
+                // Get the list of pod ips associated with this deployment.
+                let pod_ips = match kubernetes_object.pod_ips().await {
+                    Ok(pod_ips) => pod_ips,
+                    Err(err) => {
+                        warn!(logger, "Autoscaler metric task skipping object due to error retrieving pod ips";
+                            "error" => format!("{}", err));
+                        return;
+                    }
+                };
+
+                // Pull metrics from all of the pods.
+                let current_metric_value = match retrieve_aggregate_metric(
+                    logger.clone(),
+                    pod_ips.clone(),
+                    &metric_name,
+                )
+                .await
+                {
+                    Ok(Some(current_metric_value)) => current_metric_value,
+                    Ok(None) => {
+                        warn!(
+                            logger,
+                            "Autoscaler metric task skipping object due to no available metrics"
+                        );
+                        return;
+                    }
+                    Err(err) => {
+                        error!(logger, "Autoscaler metric task skipping object due to error pulling metrics";
+                            "error" => format!("{}", err));
+                        return;
+                    }
+                };
+
+                info!(logger, "Successfully pulled autoscaler metric from pods";
+                    "pod_ips" => format!("{:?}", pod_ips),
+                    "aggregate_metric_value" => current_metric_value);
+
+                // Add the received metrics into our shared queue for later pickup by the
+                // reconciliation subtask.
+                let metric_key = format!("{}/{}/{}", object_namespace, object_name, metric_name);
+                {
+                    let mut metric_repository_writer = metric_repository.lock().await;
+                    metric_repository_writer
+                        .entry(metric_key)
+                        .or_insert_with(Vec::new)
+                        .push(current_metric_value);
+                }
+            }
+        }
+    }
+
+    debug!(logger, "Stopped autoscaler metric task");
+}
+
+/// For each matching object, spawn a new reconciliation subtask.
+async fn spawn_reconciliation_tasks(
     logger: Logger,
     kube_config: kube::config::Configuration,
     autoscaler: Arc<RwLock<Option<AutoScaler>>>,
     autoscaler_namespace: String,
-    resource_kind: AutoScalerKubernetesResourceKind,
-    match_labels: BTreeMap<String, String>,
     strategy: AutoScalerStrategy,
+    metric_repository: Arc<Mutex<HashMap<String, Vec<f64>>>>,
 ) {
+    // For each matching object run the reconciliation task.
+    if let Ok(kubernetes_objects) = matching_objects(
+        logger.clone(),
+        kube_config,
+        autoscaler_namespace,
+        autoscaler.clone(),
+    )
+    .await
+    {
+        for kubernetes_object in kubernetes_objects {
+            // Resolve the name and namespace of the object.
+            let (object_namespace, object_name) = kubernetes_object.namespace_and_name();
+            debug!(logger.clone(), "Autoscaler reconciliation task found matching object";
+                "object_namespace" => &object_namespace,
+                "object_name" => &object_name);
+
+            // Run all the reconciliation tasks in parallel.
+            tokio::spawn(reconciliation_task(
+                logger.new(o!(
+                    "object_namespace" => object_namespace.clone(),
+                    "object_name" => object_name.clone())),
+                autoscaler.clone(),
+                kubernetes_object,
+                object_namespace,
+                object_name,
+                strategy.clone(),
+                metric_repository.clone(),
+            ));
+        }
+    }
+}
+
+/// Perform any reconciliation tasks required in this iteration.
+#[allow(clippy::cognitive_complexity)]
+async fn reconciliation_task(
+    logger: Logger,
+    autoscaler: Arc<RwLock<Option<AutoScaler>>>,
+    kubernetes_object: KubernetesObject,
+    object_namespace: String,
+    object_name: String,
+    strategy: AutoScalerStrategy,
+    metric_repository: Arc<Mutex<HashMap<String, Vec<f64>>>>,
+) {
+    // Ensure the object hasn't been recently modified by another pangolin autoscaler.
+    match kubernetes_object.last_modified().await {
+        Ok(Some(last_modified)) => {
+            // Has it been long enough since our last scaling operation?
+            // We subtract 5 seconds to account for any lag in this processes reconciliation loop.
+            let utc_now: DateTime<Utc> = Utc::now();
+            if utc_now.signed_duration_since(last_modified).num_seconds()
+                < autoscaler.read().await.as_ref().unwrap().spec.interval as i64 - 5
+            {
+                warn!(logger, "Autoscaler skipping object due to having been recently modified by another process");
+                return;
+            }
+        }
+        Ok(None) => (),
+        Err(err) => {
+            error!(logger, "Autoscaler skipping object due to error retrieving annotations";
+                "error" => format!("{}", err));
+            return;
+        }
+    }
+
+    // Get the current number of replicas.
+    let current_replicas = match kubernetes_object.replicas().await {
+        Ok(current_replicas) => current_replicas,
+        Err(err) => {
+            error!(logger, "Autoscaler skipping object due to error retrieving replica count";
+                "error" => format!("{}", err));
+            return;
+        }
+    };
+
+    // Retrieve the latest window of metrics from the repository
+    let metric_name = autoscaler
+        .read()
+        .await
+        .as_ref()
+        .unwrap()
+        .spec
+        .metric
+        .name
+        .clone();
+    let metric_key = format!("{}/{}/{}", object_namespace, object_name, metric_name);
+    let current_metric_value = {
+        if let Some(metric_values) = metric_repository.lock().await.remove(&metric_key) {
+            debug!(logger, "Found collected metrics for object";
+                "count" => metric_values.len());
+            Some(metric_values.iter().sum::<f64>() / metric_values.len() as f64)
+        } else {
+            None
+        }
+    };
+
+    // Do we have any metrics for this object?
+    if let Some(current_metric_value) = current_metric_value {
+        // Evaluate the autoscaling strategy.
+        if let Some(delta) = strategy.evaluate(current_replicas, current_metric_value) {
+            info!(logger, "Scaling object based on autoscaler strategy";
+                "aggregate_metric_value" => current_metric_value,
+                "current_replicas" => current_replicas,
+                "delta" => delta);
+
+            // Verify the action wouldn't exceed a maximum replicas limit.
+            if let Some(Some(max_replicas)) = autoscaler
+                .read()
+                .await
+                .as_ref()
+                .unwrap()
+                .spec
+                .limits
+                .as_ref()
+                .map(|limit| limit.replicas.as_ref().map(|replicas| replicas.max))
+            {
+                if current_replicas as i32 + delta >= max_replicas as i32 {
+                    warn!(logger, "Autoscaler refusing to scale up due to maximum replicas";
+                        "max_replicas" => max_replicas,
+                        "current_replicas" => current_replicas,
+                        "delta" => delta);
+                    return;
+                }
+            }
+
+            // Verify the action wouldn't fall below the minimum replicas limit.
+            if let Some(Some(min_replicas)) = autoscaler
+                .read()
+                .await
+                .as_ref()
+                .unwrap()
+                .spec
+                .limits
+                .as_ref()
+                .map(|limit| limit.replicas.as_ref().map(|replicas| replicas.min))
+            {
+                if current_replicas as i32 + delta <= min_replicas as i32 {
+                    warn!(logger, "Autoscaler refusing to scale down due to minimum replicas";
+                        "min_replicas" => min_replicas,
+                        "current_replicas" => current_replicas,
+                        "delta" => delta);
+                    return;
+                }
+            }
+
+            // Scale the object.
+            if let Err(err) = kubernetes_object
+                .scale((current_replicas as i32 + delta) as u32)
+                .await
+            {
+                error!(logger, "Autoscaler encountered error scaling object";
+                    "current_replicas" => current_replicas,
+                    "delta" => delta,
+                    "error" => format!("{}", err));
+                return;
+            }
+        } else {
+            info!(logger, "Object does not require scaling";
+                "aggregate_metric_value" => current_metric_value,
+                "current_replicas" => current_replicas);
+        }
+    } else {
+        // No metrics are available, there are some innocent causes for this, but most of the time
+        // it is concerning.
+        error!(logger, "Skipping scaling object due to no available metrics";
+            "aggregate_metric_value" => current_metric_value,
+            "current_replicas" => current_replicas,
+            "metric_name" => metric_name);
+    }
+}
+
+/// Find a list of matching objects for an AutoScaler.
+async fn matching_objects(
+    logger: Logger,
+    kube_config: kube::config::Configuration,
+    autoscaler_namespace: String,
+    autoscaler: Arc<RwLock<Option<AutoScaler>>>,
+) -> Result<Vec<KubernetesObject>, Error> {
+    let resource_kind = autoscaler.read().await.as_ref().unwrap().spec.kind.clone();
+    let match_labels = autoscaler
+        .read()
+        .await
+        .as_ref()
+        .unwrap()
+        .spec
+        .selector
+        .match_labels
+        .clone();
+
     // Construct a client for the expected kubernetes resource kind.
     let kubernetes_resource = match resource_kind {
         AutoScalerKubernetesResourceKind::Deployment => {
@@ -325,169 +696,12 @@ async fn autoscaler_loop(
     };
 
     // Get the list of matching kubernetes resources.
-    let kubernetes_objects = match kubernetes_resource.list().await {
-        Ok(kubernetes_objects) => kubernetes_objects,
+    match kubernetes_resource.list().await {
+        Ok(kubernetes_objects) => Ok(kubernetes_objects),
         Err(err) => {
-            warn!(logger, "AutoScaler failed to list objects";
+            warn!(logger, "Autoscaler failed to list objects";
                 "error" => format!("{}", err));
-            return;
+            Err(err)
         }
-    };
-
-    // For each matching object run the reconciliation task.
-    for kubernetes_object in kubernetes_objects {
-        // Resolve the name and namespace of the object.
-        let (object_namespace, object_name) = kubernetes_object.namespace_and_name();
-        info!(logger, "AutoScaler found matching object";
-            "object_namespace" => &object_namespace,
-            "object_name" => &object_name);
-
-        // Run all the reconciliation tasks in parallel.
-        tokio::spawn(reconciliation_loop(
-            logger.new(o!(
-                "object_namespace" => object_namespace,
-                "object_name" => object_name)),
-            autoscaler.clone(),
-            kubernetes_object,
-            strategy.clone(),
-        ));
-    }
-}
-
-#[allow(clippy::cognitive_complexity)]
-async fn reconciliation_loop(
-    logger: Logger,
-    autoscaler: Arc<RwLock<Option<AutoScaler>>>,
-    kubernetes_object: KubernetesObject,
-    strategy: AutoScalerStrategy,
-) {
-    // Ensure the object hasn't been recently modified by another pangolin autoscaler.
-    match kubernetes_object.last_modified().await {
-        Ok(Some(last_modified)) => {
-            // Has it been long enough since our last scaling operation?
-            // We subtract 5 seconds to account for any lag in this processes reconciliation loop.
-            let utc_now: DateTime<Utc> = Utc::now();
-            if utc_now.signed_duration_since(last_modified).num_seconds()
-                < autoscaler.read().await.as_ref().unwrap().spec.interval as i64 - 5
-            {
-                warn!(logger, "AutoScaler skipping object due to having been recently modified by another process");
-                return;
-            }
-        }
-        Ok(None) => (),
-        Err(err) => {
-            warn!(logger, "AutoScaler skipping object due to error retrieving annotations";
-                "error" => format!("{}", err));
-            return;
-        }
-    }
-
-    // Get the list of pod ips associated with this deployment.
-    let pod_ips = match kubernetes_object.pod_ips().await {
-        Ok(pod_ips) => pod_ips,
-        Err(err) => {
-            warn!(logger, "AutoScaler skipping object due to error retrieving pod ips";
-                "error" => format!("{}", err));
-            return;
-        }
-    };
-
-    // Pull metrics from all of the pods.
-    let metrics_retriever = MetricsRetriever::new(logger.clone(), pod_ips.clone());
-    let current_metric_value = match metrics_retriever
-        .retrieve_aggregate_metric(&autoscaler.read().await.as_ref().unwrap().spec.metric)
-        .await
-    {
-        Ok(Some(current_metric_value)) => current_metric_value,
-        Ok(None) => {
-            warn!(
-                logger,
-                "AutoScaler skipping object due to no available metrics"
-            );
-            return;
-        }
-        Err(err) => {
-            warn!(logger, "AutoScaler skipping object due to error pulling metrics";
-                "error" => format!("{}", err));
-            return;
-        }
-    };
-
-    info!(logger, "Successfully pulled AutoScaler metric from pods";
-        "pod_ips" => format!("{:?}", pod_ips),
-        "aggregate_metric_value" => current_metric_value);
-
-    // Get the current number of replicas.
-    let current_replicas = match kubernetes_object.replicas().await {
-        Ok(current_replicas) => current_replicas,
-        Err(err) => {
-            warn!(logger, "AutoScaler skipping object due to error retrieving replica count";
-                "error" => format!("{}", err));
-            return;
-        }
-    };
-
-    // Evaluate the autoscaling strategy.
-    if let Some(delta) = strategy.evaluate(current_replicas, current_metric_value) {
-        info!(logger, "Scaling object based on AutoScaler strategy";
-                "aggregate_metric_value" => current_metric_value,
-                "current_replicas" => current_replicas,
-                "delta" => delta);
-
-        // Verify the action wouldn't exceed a maximum replicas limit.
-        if let Some(Some(max_replicas)) = autoscaler
-            .read()
-            .await
-            .as_ref()
-            .unwrap()
-            .spec
-            .limits
-            .as_ref()
-            .map(|limit| limit.replicas.as_ref().map(|replicas| replicas.max))
-        {
-            if current_replicas as i32 + delta >= max_replicas as i32 {
-                warn!(logger, "AutoScaler refusing to scale up due to maximum replicas";
-                        "max_replicas" => max_replicas,
-                        "current_replicas" => current_replicas,
-                        "delta" => delta);
-                return;
-            }
-        }
-
-        // Verify the action wouldn't fall below the minimum replicas limit.
-        if let Some(Some(min_replicas)) = autoscaler
-            .read()
-            .await
-            .as_ref()
-            .unwrap()
-            .spec
-            .limits
-            .as_ref()
-            .map(|limit| limit.replicas.as_ref().map(|replicas| replicas.min))
-        {
-            if current_replicas as i32 + delta <= min_replicas as i32 {
-                warn!(logger, "AutoScaler refusing to scale down due to minimum replicas";
-                        "min_replicas" => min_replicas,
-                        "current_replicas" => current_replicas,
-                        "delta" => delta);
-                return;
-            }
-        }
-
-        // Scale the object.
-        if let Err(err) = kubernetes_object
-            .scale((current_replicas as i32 + delta) as u32)
-            .await
-        {
-            error!(logger, "AutoScaler encountered error scaling object";
-                    "current_replicas" => current_replicas,
-                    "delta" => delta,
-                    "error" => format!("{}", err));
-            return;
-        }
-    } else {
-        info!(logger, "Object does not require scaling";
-                "aggregate_metric_value" => current_metric_value,
-                "current_replicas" => current_replicas);
     }
 }

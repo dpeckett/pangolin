@@ -18,86 +18,84 @@ use crate::error::*;
 use futures::channel::mpsc::unbounded;
 use futures::sink::SinkExt;
 use futures::StreamExt;
-use slog::{info, Logger};
+use slog::{debug, Logger};
 use snafu::ResultExt;
 use std::time::Duration;
 
-pub struct MetricsRetriever {
+/// Retrieve the mean value of a Prometheus metric from a list of pod ips.
+pub async fn retrieve_aggregate_metric(
     logger: Logger,
     pod_ips: Vec<String>,
+    metric_name: &str,
+) -> Result<Option<f64>, Error> {
+    let mut metrics_receiver = {
+        // Create a channel which will receive the metrics as they are pulled in by the various http client threads.
+        let (metrics_sender, metrics_receiver) = unbounded::<Result<Option<f64>, Error>>();
+        for pod_ip in &pod_ips {
+            let pod_ip = String::from(pod_ip);
+            let metric = String::from(metric_name);
+            let mut metrics_sender = metrics_sender.clone();
+            let metrics_logger = logger.clone();
+            // Spawn a new coroutine to pull metrics from the supplied pod ip.
+            // All pod ips are interrogated concurrently.
+            tokio::spawn(async move {
+                debug!(metrics_logger, "Querying pod metrics";
+                    "pod_ip" => pod_ip.clone(),
+                    "metric_name" => metric.clone());
+                metrics_sender
+                    .send(pull_metric_from_pod(&pod_ip, &metric).await)
+                    .await
+                    .unwrap();
+            });
+        }
+        metrics_receiver
+    };
+
+    // As the pulled metrics arrive, collect the valid results.
+    let mut metric_values: Vec<f64> = Vec::new();
+    while let Some(metric_result) = metrics_receiver.next().await {
+        if let Ok(Some(metric_value)) = metric_result {
+            metric_values.push(metric_value);
+        }
+    }
+
+    // Compute the mean metric value across all pods.
+    Ok(if !metric_values.is_empty() {
+        let n_values = metric_values.len() as f64;
+        Some(metric_values.into_iter().sum::<f64>() / n_values)
+    } else {
+        None
+    })
 }
 
-impl MetricsRetriever {
-    pub fn new(logger: Logger, pod_ips: Vec<String>) -> Self {
-        Self { logger, pod_ips }
-    }
+/// Retrieve a Prometheus metric value from a pod.
+async fn pull_metric_from_pod(pod_ip: &str, metric_name: &str) -> Result<Option<f64>, Error> {
+    // Construct a new client for pulling metrics.
+    let metric_uri = format!("http://{}:9090/metrics", pod_ip);
+    let metrics_client = reqwest::Client::builder()
+        .timeout(Duration::from_millis(250))
+        .build()
+        .context(HttpClient {})?;
 
-    pub async fn retrieve_aggregate_metric(&self, metric_name: &str) -> Result<Option<f64>, Error> {
-        let mut metrics_receiver = {
-            let (metrics_sender, metrics_receiver) = unbounded::<Result<Option<f64>, Error>>();
-            for pod_ip in &self.pod_ips {
-                let pod_ip = String::from(pod_ip);
-                let metric = String::from(metric_name);
-                let mut metrics_sender = metrics_sender.clone();
-                let metrics_logger = self.logger.clone();
-                tokio::spawn(async move {
-                    info!(metrics_logger, "Querying pod metrics"; "pod_ip" => pod_ip.clone());
-                    metrics_sender
-                        .send(Self::pull_metric_from_pod(&pod_ip, &metric).await)
-                        .await
-                        .unwrap();
-                });
-            }
-            metrics_receiver
-        };
+    // Pull the Prometheus metrics from the pod.
+    let response = metrics_client
+        .get(&metric_uri)
+        .send()
+        .await
+        .context(HttpClient {})?
+        .text()
+        .await
+        .context(HttpClient {})?;
 
-        let mut metric_values: Vec<f64> = Vec::new();
-        while let Some(Ok(metric_result)) = metrics_receiver.next().await {
-            if let Some(metric_value) = metric_result {
-                metric_values.push(metric_value);
-            }
+    // Very primitive prometheus text mode parser.
+    for record in response.lines() {
+        let record = String::from(record);
+        let mut fields = record.split_whitespace();
+        if fields.next().unwrap().eq(metric_name) {
+            let metric_value: f64 = fields.next().unwrap().parse().unwrap();
+            return Ok(Some(metric_value));
         }
-
-        let n_values = metric_values.len() as f64;
-        Ok(if !metric_values.is_empty() {
-            let mean_metric_value =
-                metric_values
-                    .into_iter()
-                    .fold(0.0, |mut accum, metric_value| {
-                        accum += metric_value / n_values;
-                        accum
-                    });
-            Some(mean_metric_value)
-        } else {
-            None
-        })
     }
 
-    async fn pull_metric_from_pod(pod_ip: &str, metric_name: &str) -> Result<Option<f64>, Error> {
-        let metric_uri = format!("http://{}:9090/metrics", pod_ip);
-        let metrics_client = reqwest::Client::builder()
-            .timeout(Duration::from_millis(250))
-            .build()
-            .context(HttpClient {})?;
-
-        let response = metrics_client
-            .get(&metric_uri)
-            .send()
-            .await
-            .context(HttpClient {})?
-            .text()
-            .await
-            .context(HttpClient {})?;
-
-        // Very primitive prometheus text mode parser.
-        for record in response.lines() {
-            let record = String::from(record);
-            let mut fields = record.split_whitespace();
-            if fields.next().unwrap().eq(metric_name) {
-                let metric_value: f64 = fields.next().unwrap().parse().unwrap();
-                return Ok(Some(metric_value));
-            }
-        }
-        Ok(None)
-    }
+    Ok(None)
 }

@@ -16,7 +16,7 @@
 
 use snafu::Snafu;
 
-/// Pangolin Autoscaler errors.
+/// Pangolin error types.
 #[derive(Debug, Snafu)]
 #[snafu(visibility = "pub(crate)")]
 pub enum Error {
@@ -32,7 +32,7 @@ pub enum Error {
     #[snafu(display("kubernetes error: {}", source))]
     Kube { source: kube::Error },
 
-    /// Kubernetes specification was missing a required field.
+    /// Kubernetes specification errors.
     #[snafu(display("kubernetes spec is missing fields"))]
     KubeSpec {},
 }

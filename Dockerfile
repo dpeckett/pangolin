@@ -18,6 +18,8 @@ RUN cargo install --target x86_64-unknown-linux-musl --path .
 
 FROM alpine:3.11.3
 
+ENV LOG_LEVEL=Info
+
 COPY --from=builder /usr/local/cargo/bin/pangolin /usr/local/bin/pangolin
 
-CMD ["sh", "-c", "pangolin"]
+CMD ["sh", "-c", "pangolin --log-level=${LOG_LEVEL}"]

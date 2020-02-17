@@ -57,6 +57,7 @@ impl CancellableInterval {
     fn poll_tick(&mut self, cx: &mut Context<'_>) -> Poll<Instant> {
         ready!(Pin::new(&mut self.delay).poll(cx));
 
+        // Implement the interval via a continually reset deadline.
         let now = self.delay.deadline();
         let next = now + Duration::from_secs(self.period.load(Ordering::Relaxed) as u64);
         self.delay.reset(next);

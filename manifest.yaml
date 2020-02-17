@@ -17,6 +17,12 @@ spec:
           properties:
             spec:
               type: object
+              required:
+                - strategy
+                - kind
+                - selector
+                - metric
+                - interval
               properties:
                 strategy:
                   type: string
@@ -35,7 +41,17 @@ spec:
                       additionalProperties:
                         type: string
                 metric:
-                  type: string
+                  type: object
+                  required:
+                    - name
+                  properties:
+                    name:
+                      type: string
+                    interval:
+                      type: integer
+                      minimum: 5
+                      maximum: 900
+                      default: 10
                 interval:
                   type: integer
                   minimum: 10

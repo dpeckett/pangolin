@@ -20,6 +20,7 @@ use std::collections::BTreeMap;
 
 pub type AutoScaler = Object<AutoScalerSpec, Void>;
 
+/// Prefix to use for all object annotations.
 pub const ANNOTATION_BASE: &str = "pangolinscaler.com";
 
 /// Kubernetes resource type to scale.
@@ -43,6 +44,15 @@ pub struct AutoScalerSelector {
     /// Autoscaling deployments matching the supplied labels.
     #[serde(rename = "matchLabels")]
     pub match_labels: BTreeMap<String, String>,
+}
+
+/// Prometheus metrics configuration.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct AutoScalerMetric {
+    /// Prometheus metric for autoscaling decisions.
+    pub name: String,
+    /// How often to pull Prometheus metrics (seconds).
+    pub interval: u32,
 }
 
 /// Maximum and minimum number of replicas configuration.
@@ -79,8 +89,8 @@ pub struct AutoScalerSpec {
     pub kind: AutoScalerKubernetesResourceKind,
     /// Selector for the autoscaling target.
     pub selector: AutoScalerSelector,
-    /// Prometheus metric for autoscaling decisions.
-    pub metric: String,
+    /// Prometheus metrics configuration.
+    pub metric: AutoScalerMetric,
     /// How often to evaluate the autoscaling strategy (seconds).
     pub interval: u32,
     /// Any autoscaling limits, eg the number of replicas.

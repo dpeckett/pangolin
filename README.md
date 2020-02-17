@@ -53,8 +53,11 @@ spec:
   selector:
     matchLabels:
       app: my-application
-  # Prometheus metric for autoscaling decisions.
-  metric: response_latency_ms
+  metric:
+    # Prometheus metric for autoscaling decisions.
+    name: response_latency_ms
+    # How often to pull metrics (seconds).
+    interval: 10
   # How often to evaluate the autoscaling strategy (seconds).
   interval: 60
   # Any autoscaling limits, eg the number of replicas.

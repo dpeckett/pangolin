@@ -28,6 +28,7 @@ use serde_json::json;
 use snafu::{OptionExt, ResultExt};
 use std::collections::BTreeMap;
 
+/// Kubernetes StatefulSet resource kind related functions.
 pub struct KubernetesStatefulSetResource {
     kube_config: kube::config::Configuration,
     namespace: String,
@@ -52,6 +53,7 @@ impl KubernetesStatefulSetResource {
 impl KubernetesResourceTrait for KubernetesStatefulSetResource {
     async fn list(&self) -> Result<Vec<KubernetesObject>, Error> {
         let kube_client = APIClient::new(self.kube_config.clone());
+        // Retrieve the list of StatefulSet objects matching the label selector.
         let statefulsets = Api::v1StatefulSet(kube_client)
             .within(&self.namespace)
             .list(&ListParams {
@@ -75,6 +77,7 @@ impl KubernetesResourceTrait for KubernetesStatefulSetResource {
     }
 }
 
+/// Kubernetes StatefulSet related functions.
 pub struct KubernetesStatefulSetObject {
     kube_config: kube::config::Configuration,
     namespace: String,
@@ -106,6 +109,7 @@ impl KubernetesObjectTrait for KubernetesStatefulSetObject {
 
     async fn last_modified(&self) -> Result<Option<DateTime<Utc>>, Error> {
         Ok(
+            // Retrieve the last modified timestamp from the StatefulSet's annotations.
             if let Some(last_modified_timestamp) = self
                 .metadata
                 .annotations
@@ -156,6 +160,7 @@ impl KubernetesObjectTrait for KubernetesStatefulSetObject {
                 "replicas": replicas
             }
         });
+        // Patch (update) the StatefulSet object.
         let patch_params = PatchParams::default();
         let kube_client = APIClient::new(self.kube_config.clone());
         Api::v1StatefulSet(kube_client)

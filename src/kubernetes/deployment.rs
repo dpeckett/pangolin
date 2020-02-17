@@ -28,6 +28,7 @@ use serde_json::json;
 use snafu::{OptionExt, ResultExt};
 use std::collections::BTreeMap;
 
+/// Kubernetes Deployment resource kind related functions.
 pub struct KubernetesDeploymentResource {
     kube_config: kube::config::Configuration,
     namespace: String,
@@ -52,6 +53,7 @@ impl KubernetesDeploymentResource {
 impl KubernetesResourceTrait for KubernetesDeploymentResource {
     async fn list(&self) -> Result<Vec<KubernetesObject>, Error> {
         let kube_client = APIClient::new(self.kube_config.clone());
+        // Retrieve the list of Deployment objects matching the label selector.
         let deployments = Api::v1Deployment(kube_client)
             .within(&self.namespace)
             .list(&ListParams {
@@ -75,6 +77,7 @@ impl KubernetesResourceTrait for KubernetesDeploymentResource {
     }
 }
 
+/// Kubernetes Deployment related functions.
 pub struct KubernetesDeploymentObject {
     kube_config: kube::config::Configuration,
     namespace: String,
@@ -106,6 +109,7 @@ impl KubernetesObjectTrait for KubernetesDeploymentObject {
 
     async fn last_modified(&self) -> Result<Option<DateTime<Utc>>, Error> {
         Ok(
+            // Retrieve the last modified timestamp from the Deployment's annotations.
             if let Some(last_modified_timestamp) = self
                 .metadata
                 .annotations
@@ -156,6 +160,7 @@ impl KubernetesObjectTrait for KubernetesDeploymentObject {
                 "replicas": replicas
             }
         });
+        // Patch (update) the Deployment object.
         let patch_params = PatchParams::default();
         let kube_client = APIClient::new(self.kube_config.clone());
         Api::v1Deployment(kube_client)

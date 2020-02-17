@@ -17,15 +17,19 @@
 use crate::strategy::bang_bang::BangBangAutoScalerStrategy;
 use enum_dispatch::enum_dispatch;
 
+/// Bang-bang autoscaling strategy implementation.
 pub mod bang_bang;
 
+/// Autoscaling strategies / control algorithms.
 #[enum_dispatch]
 #[derive(Clone, Debug)]
 pub enum AutoScalerStrategy {
     BangBang(BangBangAutoScalerStrategy),
 }
 
+/// Autoscaling strtategy trait.
 #[enum_dispatch(AutoScalerStrategy)]
 pub trait AutoScalerStrategyTrait {
+    /// What is the next desired state? Return the delta in terms of the number of replicas.
     fn evaluate(&self, replicas: u32, value: f64) -> Option<i32>;
 }

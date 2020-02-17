@@ -20,6 +20,7 @@ use kube::client::APIClient;
 use snafu::ResultExt;
 use std::collections::BTreeMap;
 
+/// Retrieve all the pod ips associated with a deployment.
 pub(crate) async fn get_running_pod_ips(
     kube_client: APIClient,
     namespace: &str,
@@ -27,6 +28,7 @@ pub(crate) async fn get_running_pod_ips(
 ) -> Result<Vec<String>, Error> {
     let label_selector = Some(build_label_selector(match_labels));
 
+    // Retrieve the list of pods matching the label selector.
     let pods = Api::v1Pod(kube_client)
         .within(namespace)
         .list(&ListParams {
@@ -36,20 +38,25 @@ pub(crate) async fn get_running_pod_ips(
         .await
         .context(Kube {})?;
 
+    // Extract the address from each pod's metadata.
     let mut pod_ips: Vec<String> = Vec::new();
     for pod in pods {
-        let status = pod.status.as_ref().unwrap();
-        if let Some(phase) = &status.phase {
-            if !phase.eq_ignore_ascii_case("Running") {
-                continue;
+        if let Some(status) = &pod.status {
+            if let Some(phase) = &status.phase {
+                if !phase.eq_ignore_ascii_case("Running") {
+                    continue;
+                }
+            }
+            if let Some(pod_ip) = &status.pod_ip {
+                pod_ips.push(pod_ip.clone());
             }
         }
-        pod_ips.push(pod.status.unwrap().pod_ip.as_ref().unwrap().clone());
     }
+
     Ok(pod_ips)
 }
 
-/// Convert a matchLabels map into a list of labels for the k8s api.
+/// Convert a matchLabels map into a list of labels for the kubernetes api.
 pub(crate) fn build_label_selector(match_labels: &BTreeMap<String, String>) -> String {
     match_labels
         .iter()

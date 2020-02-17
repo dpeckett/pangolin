@@ -22,9 +22,13 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use enum_dispatch::enum_dispatch;
 
+/// Private shared functionality
 mod common;
+/// Kubernetes Deployment trait implementations.
 pub mod deployment;
+/// Kubernetes ReplicaSet trait implementations.
 pub mod replicaset;
+/// Kubernetes StatefulSet trait implementations.
 pub mod statefulset;
 
 /// Kubernetes resource families.
