@@ -20,7 +20,7 @@ spec:
               properties:
                 strategy:
                   type: string
-                  pattern: '^(Deadband)$'
+                  pattern: '^(BangBang)$'
                 kind:
                   type: string
                   pattern: '^(Deployment|ReplicaSet|StatefulSet)$'

@@ -32,7 +32,7 @@ Because it's a fantastic systems programming language and we need to see more of
 The latest stable release of Pangolin can be installed from GitHub:
 
 ```console
-foo@bar:~$ kubectl apply -f https://github.com/TODO
+foo@bar:~$ kubectl apply -f https://raw.githubusercontent.com/dpeckett/pangolin/master/manifest.yaml
 ```
 
 ## Usage
@@ -80,7 +80,7 @@ You will need the latest Rust stable toolchain installed on your machine. Refer 
 more details.
 
 ```console
-foo@bar:~$ cargo build --release .
+foo@bar:~$ cargo build --release
 ```
 
 ### Docker
@@ -88,7 +88,7 @@ foo@bar:~$ cargo build --release .
 To build an Alpine based Docker image from source:
 
 ```console
-foo@bar:~$ docker build -t pangolin:v0.1.0 .
+foo@bar:~$ docker build -t pangolinscaler/pangolin:v0.1.0 .
 ```
 
 ## Control Strategies
