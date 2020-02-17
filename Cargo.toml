@@ -1,0 +1,27 @@
+[package]
+name = "pangolin"
+version = "0.1.0"
+authors = ["Damian Peckett <damian@pecke.tt>"]
+description = "An enhanced Horizontal Pod Autoscaler for Kubernetes."
+repository = "https://github.com/dpeckett/pangolin"
+license = "Apache-2.0"
+edition = "2018"
+
+[dependencies]
+async-trait = "0.1.24"
+chrono = "0.4.10"
+clap = "2.33.0"
+enum_dispatch = "0.2.1"
+futures = "0.3.1"
+hyper = "0.13.2"
+k8s-openapi = { version = "0.7.1", default-features = false, features = ["v1_17"] }
+kube = { version = "0.25.0", features = ["openapi"]}
+# To support the alpine linux target we need to build openssl from source.
+openssl = { version = "0.10.28", features = ["vendored"] }
+reqwest = "0.10.1"
+serde_json = "1.0.48"
+serde = { version = "1.0.104", features = ["derive"] }
+slog = "2.5.2"
+slog-json = "2.3.0"
+snafu = "0.6.2"
+tokio = { version = "0.2.11", features = ["full"] }

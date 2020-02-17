@@ -1,0 +1,157 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: autoscalers.pangolinscaler.com
+spec:
+  group: pangolinscaler.com
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          required:
+            - spec
+          properties:
+            spec:
+              type: object
+              properties:
+                strategy:
+                  type: string
+                  pattern: '^(Deadband)$'
+                kind:
+                  type: string
+                  pattern: '^(Deployment|ReplicaSet|StatefulSet)$'
+                  default: Deployment
+                selector:
+                  type: object
+                  required:
+                    - matchLabels
+                  properties:
+                    matchLabels:
+                      type: object
+                      additionalProperties:
+                        type: string
+                metric:
+                  type: string
+                interval:
+                  type: integer
+                  minimum: 10
+                  maximum: 900
+                  default: 30
+                limits:
+                  type: object
+                  properties:
+                    replicas:
+                      type: object
+                      properties:
+                        min:
+                          type: integer
+                          minimum: 1
+                          default: 1
+                        max:
+                          type: integer
+                          minimum: 1
+                          default: 10
+                bangBang:
+                  type: object
+                  required:
+                    - lower
+                    - upper
+                  properties:
+                    lower:
+                      type: number
+                    upper:
+                      type: number
+  scope: Namespaced
+  names:
+    plural: autoscalers
+    singular: autoscaler
+    kind: AutoScaler
+
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: autoscaler
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: pangolin
+  namespace: autoscaler
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: pangolin-role
+rules:
+  - apiGroups:
+      - pangolinscaler.com
+    resources:
+      - autoscalers
+    verbs:
+      - get
+      - watch
+      - list
+  - apiGroups:
+      - extensions
+      - apps
+    resources:
+      - deployments
+      - replicasets
+      - statefulsets
+    verbs:
+      - get
+      - list
+      - update
+      - patch
+  - apiGroups: [""]
+    resources:
+      - pods
+    verbs:
+      - get
+      - list
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: pangolin-role-binding
+subjects:
+  - kind: ServiceAccount
+    name: pangolin
+    namespace: autoscaler
+roleRef:
+  kind: ClusterRole
+  name: pangolin-role
+  apiGroup: rbac.authorization.k8s.io
+
+---
+apiVersion: apps/v1
+kind: ReplicaSet
+metadata:
+  name: pangolin
+  namespace: autoscaler
+  labels:
+    controller: pangolin
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      controller: pangolin
+  template:
+    metadata:
+      labels:
+        controller: pangolin
+    spec:
+      serviceAccountName: pangolin
+      automountServiceAccountToken: true
+      priorityClassName: system-cluster-critical
+      containers:
+        - name: pangolin
+          image: pangolinscaler/pangolin:v0.1.0
