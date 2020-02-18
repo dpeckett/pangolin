@@ -26,7 +26,6 @@ use crate::resource::{AutoScaler, AutoScalerKubernetesResourceKind, AutoScalerSt
 use crate::strategy::bang_bang::BangBangAutoScalerStrategy;
 use crate::strategy::AutoScalerStrategy;
 use crate::strategy::AutoScalerStrategyTrait;
-use crate::timer::CancellableInterval;
 use chrono::{DateTime, Utc};
 use clap::{
     arg_enum, crate_authors, crate_description, crate_name, crate_version, value_t, App, Arg,
@@ -37,15 +36,19 @@ use futures::{SinkExt, StreamExt};
 use kube::api::{Api, Informer, ListParams, WatchEvent};
 use kube::client::APIClient;
 use kube::config;
-use slog::{debug, error, info, o, warn, Drain, Level, LevelFilter, Logger};
+use slog::{crit, debug, error, info, o, warn, Drain, Level, LevelFilter, Logger};
 use snafu::ResultExt;
 use std::collections::HashMap;
 use std::panic;
 use std::process::exit;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
+use stream_cancel::TakeUntil;
+use stream_cancel::{StreamExt as StreamCancelExt, Tripwire};
 use tokio::sync::Mutex;
 use tokio::sync::RwLock;
+use tokio::time::interval;
+use tokio::time::Interval;
 
 /// Pangolin error types.
 mod error;
@@ -58,8 +61,6 @@ mod metrics;
 mod resource;
 /// AutoScaler control strategies.
 mod strategy;
-/// Interval time sources.
-mod timer;
 
 arg_enum! {
     /// Log level command line argument.
@@ -89,14 +90,6 @@ impl From<LogLevelArgument> for Level {
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
-    // Replace the panic handler with one that will exit the process on panics (in any thread).
-    // This makes it easy for Kubernetes to restart the process if we hit anything really weird.
-    let default_hook = panic::take_hook();
-    panic::set_hook(Box::new(move |info| {
-        default_hook(info);
-        exit(1);
-    }));
-
     let matches = App::new(crate_name!())
         .version(crate_version!())
         .about(crate_description!())
@@ -121,6 +114,15 @@ async fn main() -> Result<(), Error> {
         .map(slog::Fuse),
         o!("application" => crate_name!(), "version" => crate_version!()),
     );
+
+    // Replace the panic handler with one that will exit the process on panics (in any thread).
+    // This lets Kubernetes restart the process if we hit anything unexpected.
+    let panic_logger = logger.clone();
+    let _ = panic::take_hook();
+    panic::set_hook(Box::new(move |panic_info| {
+        crit!(panic_logger, "Thread panicked"; "error" => format!("{}", panic_info));
+        exit(1);
+    }));
 
     let kube_config = if let Ok(kube_config) = kube::config::incluster_config() {
         kube_config
@@ -260,67 +262,17 @@ fn autoscaler_loop(
     let (update_sender, mut update_receiver) = unbounded::<AutoScaler>();
 
     // Create an interval timer for the reconciliation loop.
-    let timer = Arc::new(RwLock::new(CancellableInterval::new(Duration::from_secs(
-        autoscaler.spec.interval as u64,
-    ))));
+    let period = autoscaler.spec.interval;
+    let (timer_cancel, timer_tripwire) = Tripwire::new();
+    let mut timer_cancel = Some(timer_cancel);
+
     // Create an interval timer for the metrics retrieval subtask.
-    let metric_timer = Arc::new(RwLock::new(CancellableInterval::new(Duration::from_secs(
-        autoscaler.spec.metric.interval as u64,
-    ))));
+    let metric_period = autoscaler.spec.metric.interval;
+    let (metric_timer_cancel, metric_timer_tripwire) = Tripwire::new();
+    let mut metric_timer_cancel = Some(metric_timer_cancel);
 
     let autoscaler_namespace = String::from(autoscaler.metadata.namespace.as_ref().unwrap());
     let autoscaler = Arc::new(RwLock::new(Some(autoscaler)));
-
-    let timer_handle = timer.clone();
-    let metric_timer_handle = metric_timer.clone();
-    let autoscaler_update_handle = autoscaler.clone();
-    let timer_logger = logger.clone();
-
-    // AutoScaler update receiver subtask.
-    tokio::spawn(async move {
-        let initial_period = autoscaler_update_handle
-            .read()
-            .await
-            .as_ref()
-            .unwrap()
-            .spec
-            .interval;
-
-        debug!(timer_logger, "Starting autoscaler interval source";
-            "period" => initial_period);
-
-        // Process any changes to an AutoScalers timing. And update our shared AutoScaler object.
-        while let Some(updated_autoscaler) = update_receiver.next().await {
-            timer_handle
-                .read()
-                .await
-                .set_period(Duration::from_secs(updated_autoscaler.spec.interval as u64));
-
-            debug!(timer_logger, "Updated autoscaler interval source";
-                "period" => updated_autoscaler.spec.interval);
-
-            metric_timer_handle
-                .read()
-                .await
-                .set_period(Duration::from_secs(
-                    updated_autoscaler.spec.metric.interval as u64,
-                ));
-
-            debug!(timer_logger, "Updated autoscaler metric interval source";
-                "period" => updated_autoscaler.spec.interval);
-
-            autoscaler_update_handle
-                .write()
-                .await
-                .replace(updated_autoscaler);
-        }
-
-        // Shutdown interval sources, will lead to the completion of subtasks that depend upon them.
-        // Eg. is used to propagate a full shutdown.
-        timer_handle.read().await.cancel();
-        metric_timer_handle.read().await.cancel();
-        debug!(timer_logger, "Stopped autoscaler interval sources");
-    });
 
     // A repository for storing a window worth of retrieved metrics.
     // This will leak a small amount of memory when matching objects get deleted.
@@ -333,53 +285,127 @@ fn autoscaler_loop(
         kube_config.clone(),
         autoscaler_namespace.clone(),
         autoscaler.clone(),
-        metric_timer,
+        interval(Duration::from_secs(metric_period as u64)).take_until(metric_timer_tripwire),
         metric_repository.clone(),
     ));
 
     // AutoScaler reconciliation subtask.
+    tokio::spawn(reconciliation_loop(
+        logger.clone(),
+        kube_config.clone(),
+        autoscaler_namespace.clone(),
+        autoscaler.clone(),
+        interval(Duration::from_secs(period as u64)).take_until(timer_tripwire),
+        metric_repository.clone(),
+    ));
+
+    // AutoScaler update receiver subtask.
     tokio::spawn(async move {
-        debug!(logger, "Starting autoscaler task");
+        let initial_period = autoscaler.read().await.as_ref().unwrap().spec.interval;
 
-        while let Some(_) = timer.write().await.next().await {
-            // Create the strategy fresh each time, to simplify handling autoscaler spec changes.
-            let strategy = match &autoscaler.read().await.as_ref().unwrap().spec.strategy {
-                AutoScalerStrategyKind::BangBang => {
-                    if let Some(bang_bang) =
-                        &autoscaler.read().await.as_ref().unwrap().spec.bang_bang
-                    {
-                        Some(AutoScalerStrategy::BangBang(
-                            BangBangAutoScalerStrategy::new(bang_bang.clone()),
-                        ))
-                    } else {
-                        None
-                    }
-                }
-            };
+        debug!(logger, "Starting autoscaler interval source";
+            "period" => initial_period);
 
-            if let Some(strategy) = strategy {
-                // Spawn subtasks to handle reconciliation of each matching object.
-                spawn_reconciliation_tasks(
-                    logger.clone(),
-                    kube_config.clone(),
-                    autoscaler.clone(),
-                    autoscaler_namespace.clone(),
-                    strategy,
-                    metric_repository.clone(),
-                )
-                .await;
-            } else {
-                error!(
-                    logger,
-                    "Autoscaler is missing required autoscaling strategy configuration"
-                );
-            }
+        // Process any changes to an AutoScalers timing. And update our shared AutoScaler object.
+        while let Some(updated_autoscaler) = update_receiver.next().await {
+            debug!(logger, "Received autoscaler update event");
+
+            drop(timer_cancel.take());
+            drop(metric_timer_cancel.take());
+
+            debug!(logger, "Cancelled existing timer driven tasks");
+
+            autoscaler.write().await.replace(updated_autoscaler.clone());
+
+            debug!(logger, "Updated autoscaler spec");
+
+            // Create new timer sources.
+            let (updated_timer_cancel, updated_timer_tripwire) = Tripwire::new();
+            let (updated_metric_timer_cancel, updated_metric_timer_tripwire) = Tripwire::new();
+            timer_cancel.replace(updated_timer_cancel);
+            metric_timer_cancel.replace(updated_metric_timer_cancel);
+
+            debug!(logger, "Spawning updated timer driven tasks");
+
+            // Updated AutoScaler metrics retrieval subtask.
+            tokio::spawn(metric_retriever_loop(
+                logger.clone(),
+                kube_config.clone(),
+                autoscaler_namespace.clone(),
+                autoscaler.clone(),
+                interval(Duration::from_secs(
+                    updated_autoscaler.spec.metric.interval as u64,
+                ))
+                .take_until(updated_metric_timer_tripwire),
+                metric_repository.clone(),
+            ));
+
+            // Updated AutoScaler reconciliation subtask.
+            tokio::spawn(reconciliation_loop(
+                logger.clone(),
+                kube_config.clone(),
+                autoscaler_namespace.clone(),
+                autoscaler.clone(),
+                interval(Duration::from_secs(updated_autoscaler.spec.interval as u64))
+                    .take_until(updated_timer_tripwire),
+                metric_repository.clone(),
+            ));
         }
 
-        debug!(logger, "Stopped autoscaler task");
+        // Shutdown interval sources, will lead to the completion of subtasks that depend upon them.
+        // Eg. is used to propagate a full shutdown.
+        drop(timer_cancel.take());
+        drop(metric_timer_cancel.take());
+        debug!(logger, "Cancelled timer driven tasks");
     });
 
     Ok(update_sender)
+}
+
+async fn reconciliation_loop(
+    logger: Logger,
+    kube_config: kube::config::Configuration,
+    autoscaler_namespace: String,
+    autoscaler: Arc<RwLock<Option<AutoScaler>>>,
+    mut timer: TakeUntil<Interval, Tripwire>,
+    metric_repository: Arc<Mutex<HashMap<String, Vec<f64>>>>,
+) {
+    debug!(logger, "Starting autoscaler task");
+
+    while let Some(_) = timer.next().await {
+        // Create the strategy fresh each time, to simplify handling autoscaler spec changes.
+        let strategy = match &autoscaler.read().await.as_ref().unwrap().spec.strategy {
+            AutoScalerStrategyKind::BangBang => {
+                if let Some(bang_bang) = &autoscaler.read().await.as_ref().unwrap().spec.bang_bang {
+                    Some(AutoScalerStrategy::BangBang(
+                        BangBangAutoScalerStrategy::new(bang_bang.clone()),
+                    ))
+                } else {
+                    None
+                }
+            }
+        };
+
+        if let Some(strategy) = strategy {
+            // Spawn subtasks to handle reconciliation of each matching object.
+            spawn_reconciliation_tasks(
+                logger.clone(),
+                kube_config.clone(),
+                autoscaler.clone(),
+                autoscaler_namespace.clone(),
+                strategy,
+                metric_repository.clone(),
+            )
+            .await;
+        } else {
+            error!(
+                logger,
+                "Autoscaler is missing required autoscaling strategy configuration"
+            );
+        }
+    }
+
+    debug!(logger, "Stopped autoscaler task");
 }
 
 /// Task to pull metrics from all objects associated with an AutoScaler.
@@ -388,12 +414,12 @@ async fn metric_retriever_loop(
     kube_config: kube::config::Configuration,
     autoscaler_namespace: String,
     autoscaler: Arc<RwLock<Option<AutoScaler>>>,
-    metric_timer: Arc<RwLock<CancellableInterval>>,
+    mut metric_timer: TakeUntil<Interval, Tripwire>,
     metric_repository: Arc<Mutex<HashMap<String, Vec<f64>>>>,
 ) {
     debug!(logger, "Starting autoscaler metric task");
 
-    while let Some(_) = metric_timer.write().await.next().await {
+    while let Some(_) = metric_timer.next().await {
         let metric_name = autoscaler
             .read()
             .await
