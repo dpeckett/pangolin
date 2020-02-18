@@ -51,7 +51,7 @@ mod tests {
     async fn test_bang_bang_strategy() {
         let strategy = BangBangAutoScalerStrategy::new(AutoScalerBangBangStrategyConfiguration {
             lower: 10.0,
-            upper: 30.0
+            upper: 30.0,
         });
 
         assert_eq!(strategy.evaluate(1, 32.0).unwrap(), 1);

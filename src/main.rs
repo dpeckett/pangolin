@@ -105,15 +105,19 @@ async fn main() -> Result<(), Error> {
         )
         .get_matches();
 
-    let log_level = value_t!(matches, "LOG_LEVEL", LogLevelArgument).unwrap_or_else(|e| e.exit());
+    let log_level: Level = value_t!(matches, "LOG_LEVEL", LogLevelArgument)
+        .unwrap_or_else(|e| e.exit())
+        .into();
     let logger = Logger::root(
         StdMutex::new(LevelFilter::new(
             slog_json::Json::default(std::io::stdout()),
-            log_level.into(),
+            log_level,
         ))
         .map(slog::Fuse),
         o!("application" => crate_name!(), "version" => crate_version!()),
     );
+
+    info!(logger, "Configured structured logger"; "log_level" => format!("{:?}", log_level));
 
     // Replace the panic handler with one that will exit the process on panics (in any thread).
     // This lets Kubernetes restart the process if we hit anything unexpected.
@@ -241,7 +245,7 @@ async fn main() -> Result<(), Error> {
                         "autoscaler_name" => &autoscaler.metadata.name);
                     let task_key = format!("{}/{}", autoscaler_namespace, autoscaler.metadata.name);
                     // Dropping the handle will terminate the task.
-                    task_handle.remove(&task_key);
+                    drop(task_handle.remove(&task_key));
                 }
                 WatchEvent::Error(err) => {
                     // AutoScaler object error.
@@ -429,70 +433,15 @@ async fn metric_retriever_loop(
             .name
             .clone();
 
-        if let Ok(kubernetes_objects) = matching_objects(
+        metrics_retriever_task(
             logger.clone(),
             kube_config.clone(),
             autoscaler_namespace.clone(),
             autoscaler.clone(),
+            metric_repository.clone(),
+            metric_name,
         )
-        .await
-        {
-            for kubernetes_object in kubernetes_objects {
-                // Resolve the name and namespace of the object.
-                let (object_namespace, object_name) = kubernetes_object.namespace_and_name();
-                debug!(logger.clone(), "Autoscaler metric task found matching object";
-                    "object_namespace" => &object_namespace,
-                    "object_name" => &object_name);
-
-                // Get the list of pod ips associated with this deployment.
-                let pod_ips_and_ports = match kubernetes_object.pod_ips().await {
-                    Ok(pod_ips) => pod_ips.iter().map(|pod_ip| format!("{}:9090", pod_ip)).collect::<Vec<_>>(),
-                    Err(err) => {
-                        warn!(logger, "Autoscaler metric task skipping object due to error retrieving pod ips";
-                            "error" => format!("{}", err));
-                        return;
-                    }
-                };
-
-                // Pull metrics from all of the pods.
-                let current_metric_value = match retrieve_aggregate_metric(
-                    logger.clone(),
-                    pod_ips_and_ports.clone(),
-                    &metric_name,
-                )
-                .await
-                {
-                    Ok(Some(current_metric_value)) => current_metric_value,
-                    Ok(None) => {
-                        warn!(
-                            logger,
-                            "Autoscaler metric task skipping object due to no available metrics"
-                        );
-                        return;
-                    }
-                    Err(err) => {
-                        error!(logger, "Autoscaler metric task skipping object due to error pulling metrics";
-                            "error" => format!("{}", err));
-                        return;
-                    }
-                };
-
-                info!(logger, "Successfully pulled autoscaler metric from pods";
-                    "pod_ips_and_ports" => format!("{:?}", pod_ips_and_ports),
-                    "aggregate_metric_value" => current_metric_value);
-
-                // Add the received metrics into our shared queue for later pickup by the
-                // reconciliation subtask.
-                let metric_key = format!("{}/{}/{}", object_namespace, object_name, metric_name);
-                {
-                    let mut metric_repository_writer = metric_repository.lock().await;
-                    metric_repository_writer
-                        .entry(metric_key)
-                        .or_insert_with(Vec::new)
-                        .push(current_metric_value);
-                }
-            }
-        }
+        .await;
     }
 
     debug!(logger, "Stopped autoscaler metric task");
@@ -674,6 +623,84 @@ async fn reconciliation_task(
             "aggregate_metric_value" => current_metric_value,
             "current_replicas" => current_replicas,
             "metric_name" => metric_name);
+    }
+}
+
+/// Every metrics retrieval interval run task.
+async fn metrics_retriever_task(
+    logger: Logger,
+    kube_config: kube::config::Configuration,
+    autoscaler_namespace: String,
+    autoscaler: Arc<RwLock<Option<AutoScaler>>>,
+    metric_repository: Arc<Mutex<HashMap<String, Vec<f64>>>>,
+    metric_name: String,
+) {
+    if let Ok(kubernetes_objects) = matching_objects(
+        logger.clone(),
+        kube_config.clone(),
+        autoscaler_namespace.clone(),
+        autoscaler.clone(),
+    )
+    .await
+    {
+        for kubernetes_object in kubernetes_objects {
+            // Resolve the name and namespace of the object.
+            let (object_namespace, object_name) = kubernetes_object.namespace_and_name();
+            debug!(logger.clone(), "Autoscaler metric task found matching object";
+                    "object_namespace" => &object_namespace,
+                    "object_name" => &object_name);
+
+            // Get the list of pod ips associated with this deployment.
+            let pod_ips_and_ports = match kubernetes_object.pod_ips().await {
+                Ok(pod_ips) => pod_ips
+                    .iter()
+                    .map(|pod_ip| format!("{}:9090", pod_ip))
+                    .collect::<Vec<_>>(),
+                Err(err) => {
+                    warn!(logger, "Autoscaler metric task skipping object due to error retrieving pod ips";
+                            "error" => format!("{}", err));
+                    return;
+                }
+            };
+
+            // Pull metrics from all of the pods.
+            let current_metric_value = match retrieve_aggregate_metric(
+                logger.clone(),
+                pod_ips_and_ports.clone(),
+                &metric_name,
+            )
+            .await
+            {
+                Ok(Some(current_metric_value)) => current_metric_value,
+                Ok(None) => {
+                    warn!(
+                        logger,
+                        "Autoscaler metric task skipping object due to no available metrics"
+                    );
+                    return;
+                }
+                Err(err) => {
+                    error!(logger, "Autoscaler metric task skipping object due to error pulling metrics";
+                            "error" => format!("{}", err));
+                    return;
+                }
+            };
+
+            info!(logger, "Successfully pulled autoscaler metric from pods";
+                    "pod_ips_and_ports" => format!("{:?}", pod_ips_and_ports),
+                    "aggregate_metric_value" => current_metric_value);
+
+            // Add the received metrics into our shared queue for later pickup by the
+            // reconciliation subtask.
+            let metric_key = format!("{}/{}/{}", object_namespace, object_name, metric_name);
+            {
+                let mut metric_repository_writer = metric_repository.lock().await;
+                metric_repository_writer
+                    .entry(metric_key)
+                    .or_insert_with(Vec::new)
+                    .push(current_metric_value);
+            }
+        }
     }
 }
 

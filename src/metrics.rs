@@ -69,7 +69,10 @@ pub async fn retrieve_aggregate_metric(
 }
 
 /// Retrieve a Prometheus metric value from a pod.
-async fn pull_metric_from_pod(pod_ip_and_port: &str, metric_name: &str) -> Result<Option<f64>, Error> {
+async fn pull_metric_from_pod(
+    pod_ip_and_port: &str,
+    metric_name: &str,
+) -> Result<Option<f64>, Error> {
     // Construct a new client for pulling metrics.
     let metric_uri = format!("http://{}/metrics", pod_ip_and_port);
     let metrics_client = reqwest::Client::builder()
@@ -103,12 +106,12 @@ async fn pull_metric_from_pod(pod_ip_and_port: &str, metric_name: &str) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::{SocketAddr, TcpListener};
-    use hyper::service::{make_service_fn, service_fn};
-    use hyper::{Server, Request, Body, Response};
-    use futures::{future, FutureExt};
     use futures::channel::oneshot;
-    use slog::{Drain, o};
+    use futures::{future, FutureExt};
+    use hyper::service::{make_service_fn, service_fn};
+    use hyper::{Body, Request, Response, Server};
+    use slog::{o, Drain};
+    use std::net::{SocketAddr, TcpListener};
     use tokio::time::delay_for;
 
     #[tokio::test]
@@ -118,7 +121,10 @@ mod tests {
 
         delay_for(Duration::from_millis(20)).await;
 
-        let response_latency_ms = pull_metric_from_pod(&format!("localhost:{}", port), "response_latency_ms").await.unwrap();
+        let response_latency_ms =
+            pull_metric_from_pod(&format!("localhost:{}", port), "response_latency_ms")
+                .await
+                .unwrap();
         shutdown_sender.send(()).unwrap();
 
         assert_eq!(response_latency_ms.unwrap() as i32, 220);
@@ -134,8 +140,14 @@ mod tests {
 
         delay_for(Duration::from_millis(20)).await;
 
-        let pod_ips_and_ports = vec![format!("localhost:{}", port), format!("localhost:{}", second_port)];
-        let response_latency_ms = retrieve_aggregate_metric(get_logger(), pod_ips_and_ports, "response_latency_ms").await.unwrap();
+        let pod_ips_and_ports = vec![
+            format!("localhost:{}", port),
+            format!("localhost:{}", second_port),
+        ];
+        let response_latency_ms =
+            retrieve_aggregate_metric(get_logger(), pod_ips_and_ports, "response_latency_ms")
+                .await
+                .unwrap();
 
         shutdown_sender.send(()).unwrap();
         second_shutdown_sender.send(()).unwrap();
@@ -146,9 +158,7 @@ mod tests {
     fn spawn_server(port: u16, response_latency_ms: f64) -> oneshot::Sender<()> {
         let (shutdown_sender, shutdown_receiver) = oneshot::channel::<()>();
         tokio::spawn(async move {
-            let addr: SocketAddr = format!("127.0.0.1:{}", port)
-                .parse()
-                .unwrap();
+            let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
             Server::bind(&addr)
                 .serve(make_service_fn(|_| {
                     let service = service_fn(move |request| {
@@ -166,11 +176,7 @@ mod tests {
     }
 
     async fn serve(request: Request<Body>, response_latency_ms: f64) -> Response<Body> {
-        if request
-            .uri()
-            .path()
-            .eq("/metrics")
-        {
+        if request.uri().path().eq("/metrics") {
             Response::builder()
                 .status(200)
                 .header("Content-Type", "text/plain")
@@ -191,9 +197,6 @@ mod tests {
 
     fn get_logger() -> Logger {
         let plain = slog_term::PlainSyncDecorator::new(std::io::stdout());
-        Logger::root(
-            slog_term::FullFormat::new(plain)
-                .build().fuse(), o!()
-        )
+        Logger::root(slog_term::FullFormat::new(plain).build().fuse(), o!())
     }
 }
