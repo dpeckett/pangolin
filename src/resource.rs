@@ -20,7 +20,7 @@ use std::collections::BTreeMap;
 
 pub type AutoScaler = Object<AutoScalerSpec, Void>;
 
-/// Prefix to use for all object annotations.
+/// Prefix to use for all annotations.
 pub const ANNOTATION_BASE: &str = "pangolinscaler.com";
 
 /// Kubernetes resource type to scale.

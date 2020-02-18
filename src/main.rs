@@ -252,7 +252,6 @@ async fn main() -> Result<(), Error> {
     }
 }
 
-/// Spawn a set of looping tasks to handle all the subtasks associated with an AutoScaler object.
 fn autoscaler_loop(
     logger: Logger,
     kube_config: kube::config::Configuration,
@@ -446,8 +445,8 @@ async fn metric_retriever_loop(
                     "object_name" => &object_name);
 
                 // Get the list of pod ips associated with this deployment.
-                let pod_ips = match kubernetes_object.pod_ips().await {
-                    Ok(pod_ips) => pod_ips,
+                let pod_ips_and_ports = match kubernetes_object.pod_ips().await {
+                    Ok(pod_ips) => pod_ips.iter().map(|pod_ip| format!("{}:9090", pod_ip)).collect::<Vec<_>>(),
                     Err(err) => {
                         warn!(logger, "Autoscaler metric task skipping object due to error retrieving pod ips";
                             "error" => format!("{}", err));
@@ -458,7 +457,7 @@ async fn metric_retriever_loop(
                 // Pull metrics from all of the pods.
                 let current_metric_value = match retrieve_aggregate_metric(
                     logger.clone(),
-                    pod_ips.clone(),
+                    pod_ips_and_ports.clone(),
                     &metric_name,
                 )
                 .await
@@ -479,7 +478,7 @@ async fn metric_retriever_loop(
                 };
 
                 info!(logger, "Successfully pulled autoscaler metric from pods";
-                    "pod_ips" => format!("{:?}", pod_ips),
+                    "pod_ips_and_ports" => format!("{:?}", pod_ips_and_ports),
                     "aggregate_metric_value" => current_metric_value);
 
                 // Add the received metrics into our shared queue for later pickup by the

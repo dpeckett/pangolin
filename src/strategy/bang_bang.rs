@@ -42,3 +42,20 @@ impl AutoScalerStrategyTrait for BangBangAutoScalerStrategy {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_bang_bang_strategy() {
+        let strategy = BangBangAutoScalerStrategy::new(AutoScalerBangBangStrategyConfiguration {
+            lower: 10.0,
+            upper: 30.0
+        });
+
+        assert_eq!(strategy.evaluate(1, 32.0).unwrap(), 1);
+        assert!(strategy.evaluate(1, 20.0).is_none());
+        assert_eq!(strategy.evaluate(1, 8.0).unwrap(), -1);
+    }
+}

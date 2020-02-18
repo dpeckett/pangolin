@@ -26,3 +26,6 @@ slog-json = "2.3.0"
 stream-cancel = "0.5.2"
 snafu = "0.6.2"
 tokio = { version = "0.2.11", features = ["full"] }
+
+[dev-dependencies]
+slog-term = "2.5.0"

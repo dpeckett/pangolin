@@ -13,10 +13,9 @@ using a variety of highly configurable control strategies.
 * None of the existing third party Kubernetes autoscaling tools appear to based on a solid control theory foundations.
 
 There's a few major sources of potential risk when it comes to autoscaling. Many of these sources of risk fall within
-the scope of the application providing control authority.
-
-The hypothesis behind Pangolin is that more robust control authority will lead to a significant reduction in 
-autoscaling risk. Eg. loop stability, resilient monitoring, measurement latency, outlier detection etc.
+the scope of the application providing control authority. The hypothesis behind Pangolin is that more robust control
+authority will lead to a significant reduction in autoscaling risk. Eg. loop stability, resilient monitoring, 
+measurement latency, outlier detection etc.
 
 ## Why Rust?
 

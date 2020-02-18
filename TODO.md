@@ -5,7 +5,7 @@
 * Expose a prometheus metrics port on Pangolin itself.
 * What happens when two or more autoscalers match the same resource? Collision detection?
 * Put together an integration test framework for verifying autoscaler behavior.
-* Full unit test coverage.
+* Unit test coverage for `main.rs`?.
 * Put together a CI/CD pipeline.
 * Code contribution guidelines etc.
 * Implement tunable PID controller.
